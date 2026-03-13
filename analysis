@@ -1,0 +1,1855 @@
+#!/usr/bin/env python3
+"""
+Stock Investment Analysis Tool v2.0 (Audit-Fixed)
+===================================================
+Generates a comprehensive Excel workbook with 8 analytical sheets.
+Fixes applied from deep audit: proper WACC, multi-scenario DCF,
+sensitivity analysis, sector calibration, currency handling, data guards.
+
+Usage: python analyze.py AAPL
+Requirements: pip install yfinance openpyxl numpy pandas
+"""
+
+import sys, datetime, warnings
+warnings.filterwarnings("ignore")
+
+try:
+    import yfinance as yf
+except ImportError:
+    print("ERROR: pip install yfinance"); sys.exit(1)
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.chart import LineChart, Reference, BarChart
+    from openpyxl.utils import get_column_letter
+    from openpyxl.formatting.rule import CellIsRule
+except ImportError:
+    print("ERROR: pip install openpyxl"); sys.exit(1)
+
+import numpy as np, pandas as pd
+
+# ═══════════════════════════════════════════════════════════════════════
+# GLOBAL STYLES
+# ═══════════════════════════════════════════════════════════════════════
+
+ACCENT = PatternFill("solid", fgColor="2E5090")
+LIGHT = PatternFill("solid", fgColor="F2F6FC")
+INPUT_BG = PatternFill("solid", fgColor="FFF9E6")
+GREEN_BG = PatternFill("solid", fgColor="E2EFDA")
+RED_BG = PatternFill("solid", fgColor="FCE4EC")
+YELLOW_BG = PatternFill("solid", fgColor="FFF9E6")
+H_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+T_FONT = Font(name="Arial", bold=True, color="1B2A4A", size=14)
+S_FONT = Font(name="Arial", bold=True, color="2E5090", size=12)
+L_FONT = Font(name="Arial", bold=True, color="333333", size=10)
+D_FONT = Font(name="Arial", color="333333", size=10)
+B_INPUT = Font(name="Arial", color="0000FF", size=10)
+WARN_FONT = Font(name="Arial", color="C00000", size=10, bold=True)
+NOTE_FONT = Font(name="Arial", color="666666", size=9, italic=True)
+OK_FONT = Font(name="Arial", color="006100", size=10)
+
+PCT = '0.0%'; NUM = '#,##0'; DEC = '#,##0.00'
+BDR = Border(
+    left=Side(style="thin", color="D9D9D9"), right=Side(style="thin", color="D9D9D9"),
+    top=Side(style="thin", color="D9D9D9"), bottom=Side(style="thin", color="D9D9D9"),
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+# CURRENCY HANDLING (FIX 1.11)
+# ═══════════════════════════════════════════════════════════════════════
+
+CURRENCY_SYMBOLS = {
+    "USD": "$", "EUR": "€", "GBP": "£", "CZK": "Kč ", "JPY": "¥",
+    "CHF": "CHF ", "CAD": "CA$", "AUD": "A$", "CNY": "¥", "SEK": "kr ",
+    "NOK": "kr ", "DKK": "kr ", "PLN": "zł ", "HUF": "Ft ", "INR": "₹",
+    "KRW": "₩", "BRL": "R$", "MXN": "MX$", "ZAR": "R ",
+}
+
+def get_currency_formats(info):
+    """Return currency format strings based on the company's reporting currency."""
+    currency = info.get("currency", "USD")
+    sym = CURRENCY_SYMBOLS.get(currency, currency + " ")
+    return {
+        "CUR": f'{sym}#,##0.00',
+        "CURM": f'{sym}#,##0',
+        "CURB": f'{sym}#,##0,,,"B"',
+        "symbol": sym,
+        "code": currency,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTOR BENCHMARKS (FIX 2.4, 3.6)
+# ═══════════════════════════════════════════════════════════════════════
+
+SECTOR_BENCHMARKS = {
+    "Technology": {
+        "growth_cap": 0.30, "growth_floor": -0.10, "de_threshold": 1.0,
+        "pe_normal": (20, 40), "gross_margin_wide": 0.70, "terminal_g": 0.03,
+        "rev_growth_bull": 0.15, "roe_good": 0.18,
+    },
+    "Communication Services": {
+        "growth_cap": 0.25, "growth_floor": -0.10, "de_threshold": 1.5,
+        "pe_normal": (15, 30), "gross_margin_wide": 0.55, "terminal_g": 0.025,
+        "rev_growth_bull": 0.10, "roe_good": 0.15,
+    },
+    "Consumer Defensive": {
+        "growth_cap": 0.12, "growth_floor": -0.05, "de_threshold": 2.0,
+        "pe_normal": (15, 25), "gross_margin_wide": 0.45, "terminal_g": 0.025,
+        "rev_growth_bull": 0.06, "roe_good": 0.15,
+    },
+    "Consumer Cyclical": {
+        "growth_cap": 0.20, "growth_floor": -0.15, "de_threshold": 1.5,
+        "pe_normal": (12, 25), "gross_margin_wide": 0.45, "terminal_g": 0.025,
+        "rev_growth_bull": 0.10, "roe_good": 0.15,
+    },
+    "Healthcare": {
+        "growth_cap": 0.25, "growth_floor": -0.10, "de_threshold": 1.5,
+        "pe_normal": (15, 30), "gross_margin_wide": 0.65, "terminal_g": 0.025,
+        "rev_growth_bull": 0.10, "roe_good": 0.15,
+    },
+    "Financial Services": {
+        "growth_cap": 0.15, "growth_floor": -0.10, "de_threshold": None,
+        "pe_normal": (8, 15), "gross_margin_wide": None, "terminal_g": 0.02,
+        "rev_growth_bull": 0.08, "roe_good": 0.12,
+    },
+    "Utilities": {
+        "growth_cap": 0.08, "growth_floor": -0.05, "de_threshold": 3.0,
+        "pe_normal": (12, 20), "gross_margin_wide": 0.50, "terminal_g": 0.02,
+        "rev_growth_bull": 0.05, "roe_good": 0.10,
+    },
+    "Industrials": {
+        "growth_cap": 0.18, "growth_floor": -0.10, "de_threshold": 2.0,
+        "pe_normal": (12, 22), "gross_margin_wide": 0.40, "terminal_g": 0.025,
+        "rev_growth_bull": 0.08, "roe_good": 0.15,
+    },
+    "Energy": {
+        "growth_cap": 0.15, "growth_floor": -0.20, "de_threshold": 2.0,
+        "pe_normal": (8, 18), "gross_margin_wide": 0.45, "terminal_g": 0.02,
+        "rev_growth_bull": 0.10, "roe_good": 0.12,
+    },
+    "Real Estate": {
+        "growth_cap": 0.12, "growth_floor": -0.10, "de_threshold": 3.0,
+        "pe_normal": (20, 40), "gross_margin_wide": 0.55, "terminal_g": 0.02,
+        "rev_growth_bull": 0.06, "roe_good": 0.08,
+    },
+    "Basic Materials": {
+        "growth_cap": 0.15, "growth_floor": -0.20, "de_threshold": 1.5,
+        "pe_normal": (8, 18), "gross_margin_wide": 0.35, "terminal_g": 0.02,
+        "rev_growth_bull": 0.08, "roe_good": 0.12,
+    },
+}
+
+DEFAULT_SECTOR = {
+    "growth_cap": 0.20, "growth_floor": -0.10, "de_threshold": 2.0,
+    "pe_normal": (12, 25), "gross_margin_wide": 0.55, "terminal_g": 0.025,
+    "rev_growth_bull": 0.10, "roe_good": 0.15,
+}
+
+# Country risk premiums (FIX 1.8)
+COUNTRY_CRP = {
+    "United States": 0, "Canada": 0, "United Kingdom": 0.005,
+    "Germany": 0.005, "France": 0.005, "Netherlands": 0.005,
+    "Switzerland": 0, "Japan": 0.01, "Australia": 0,
+    "China": 0.02, "India": 0.02, "Brazil": 0.03,
+    "Czech Republic": 0.01, "Poland": 0.01, "Hungary": 0.015,
+    "South Korea": 0.005, "Taiwan": 0.005, "Mexico": 0.02,
+    "Russia": 0.05, "Turkey": 0.04, "South Africa": 0.03,
+}
+
+# Country statutory tax rates (FIX 1.9)
+COUNTRY_TAX = {
+    "United States": 0.21, "United Kingdom": 0.25, "Germany": 0.30,
+    "France": 0.258, "Netherlands": 0.258, "Ireland": 0.125,
+    "Switzerland": 0.15, "Japan": 0.305, "China": 0.25,
+    "India": 0.252, "Brazil": 0.34, "Canada": 0.265,
+    "Czech Republic": 0.21, "Poland": 0.19, "Hungary": 0.09,
+    "South Korea": 0.242, "Australia": 0.30, "Sweden": 0.206,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════
+
+def sh(ws, r, mc, f=ACCENT):
+    for c in range(1, mc + 1):
+        cl = ws.cell(row=r, column=c)
+        cl.font = H_FONT; cl.fill = f
+        cl.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cl.border = BDR
+
+def sd(cell, fmt=None, inp=False):
+    cell.font = B_INPUT if inp else D_FONT
+    cell.fill = INPUT_BG if inp else PatternFill()
+    cell.border = BDR
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    if fmt:
+        cell.number_format = fmt
+
+def aw(ws, mn=10, mx=30):
+    for cc in ws.columns:
+        l = mn; cl = get_column_letter(cc[0].column)
+        for c in cc:
+            if c.value:
+                l = max(l, min(len(str(c.value)) + 3, mx))
+        ws.column_dimensions[cl].width = l
+
+def acf(ws, rng):
+    ws.conditional_formatting.add(
+        rng, CellIsRule(operator="greaterThan", formula=["0"],
+                        fill=PatternFill("solid", fgColor="E2EFDA"), font=Font(color="006100")))
+    ws.conditional_formatting.add(
+        rng, CellIsRule(operator="lessThan", formula=["0"],
+                        fill=PatternFill("solid", fgColor="FCE4EC"), font=Font(color="9C0006")))
+
+def sg(info, k, d="N/A"):
+    v = info.get(k, d)
+    return v if v is not None else d
+
+def sdv(a, b):
+    """Safe division with None/NaN/zero handling."""
+    try:
+        if b is None or b == 0 or pd.isna(b):
+            return None
+        if a is None or pd.isna(a):
+            return None
+        return a / b
+    except:
+        return None
+
+def alt_row(ws, row, max_col):
+    """Apply alternating row shading."""
+    if row % 2 == 0:
+        for cc in range(1, max_col + 1):
+            if ws.cell(row=row, column=cc).fill == PatternFill():
+                ws.cell(row=row, column=cc).fill = LIGHT
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ROBUST DATA EXTRACTION (FIX 1.12, 3.7)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _get_financial_val(stock, df_type, row_names, col_idx=0):
+    """
+    Extract a value from financials/balance_sheet with multiple row aliases.
+    row_names can be a string or list of strings to try in order.
+    Returns first successful match or None.
+    """
+    df = getattr(stock, df_type, None)
+    if df is None or df.empty:
+        return None
+    if isinstance(row_names, str):
+        row_names = [row_names]
+    for rn in row_names:
+        m = [r for r in df.index if rn.lower() in str(r).lower()]
+        if m and col_idx < len(df.columns):
+            v = df.loc[m[0]].iloc[col_idx]
+            if pd.notna(v):
+                val = float(v)
+                if abs(val) > 1e15:  # sanity check
+                    continue
+                return val
+    return None
+
+
+def _get_tax_rate(stock, info):
+    """Get effective tax rate with fallbacks. (FIX 1.9)"""
+    # 1. Try yfinance effective tax rate
+    eff = info.get("effectiveTaxRate")
+    if eff and isinstance(eff, (int, float)) and 0.01 < eff < 0.55:
+        return eff
+    # 2. Try computing from financials: Tax Provision / Pretax Income
+    pretax = _get_financial_val(stock, "financials", ["Pretax Income", "Income Before Tax"], 0)
+    tax_prov = _get_financial_val(stock, "financials", ["Tax Provision", "Income Tax Expense"], 0)
+    if pretax and tax_prov and pretax > 0:
+        computed = tax_prov / pretax
+        if 0.01 < computed < 0.55:
+            return computed
+    # 3. Country-based statutory rate
+    country = info.get("country", "United States")
+    return COUNTRY_TAX.get(country, 0.21)
+
+
+def _get_shares(info):
+    """Get diluted shares outstanding with fallback. (FIX 1.10)"""
+    # Prefer implied (diluted) shares
+    shr = info.get("impliedSharesOutstanding")
+    if shr and isinstance(shr, (int, float)) and shr > 0:
+        return shr
+    shr = info.get("sharesOutstanding")
+    if shr and isinstance(shr, (int, float)) and shr > 0:
+        return shr
+    return 1  # absolute fallback to prevent division by zero
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SHEET 1: DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════
+
+def create_dashboard(wb, ticker, info, hist):
+    cfmt = get_currency_formats(info)
+    CUR = cfmt["CUR"]; CURM = cfmt["CURM"]; CURB = cfmt["CURB"]
+    ws = wb.active; ws.title = "Dashboard"; ws.sheet_properties.tabColor = "1B2A4A"
+
+    ws.merge_cells("A1:F1")
+    c = ws["A1"]
+    c.value = f"Investment Analysis: {info.get('shortName', ticker.upper())}"
+    c.font = Font(name="Arial", bold=True, color="1B2A4A", size=18)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 40
+
+    ws.merge_cells("A2:F2")
+    ws["A2"].value = f"Ticker: {ticker.upper()} | {datetime.date.today().strftime('%B %d, %Y')} | Currency: {cfmt['code']}"
+    ws["A2"].font = Font(name="Arial", color="666666", size=10, italic=True)
+    ws["A2"].alignment = Alignment(horizontal="center")
+
+    row = 4
+    ws.merge_cells(f"A{row}:B{row}"); ws[f"A{row}"].value = "KEY METRICS"; ws[f"A{row}"].font = S_FONT; row += 1
+    for lb, v, fm in [
+        ("Current Price", sg(info, "currentPrice"), CUR),
+        ("Market Cap", sg(info, "marketCap"), CURB),
+        ("Enterprise Value", sg(info, "enterpriseValue"), CURB),
+        ("52-Week High", sg(info, "fiftyTwoWeekHigh"), CUR),
+        ("52-Week Low", sg(info, "fiftyTwoWeekLow"), CUR),
+        ("Beta", sg(info, "beta"), DEC),
+        ("Avg Volume", sg(info, "averageVolume"), NUM),
+        ("Shares Outstanding", sg(info, "sharesOutstanding"), '#,##0,,"M"'),
+    ]:
+        ws.cell(row=row, column=1, value=lb).font = L_FONT
+        ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=v); sd(c, fm); row += 1
+
+    row += 1
+    ws.merge_cells(f"A{row}:B{row}"); ws[f"A{row}"].value = "VALUATION RATIOS"; ws[f"A{row}"].font = S_FONT; row += 1
+    for lb, v, fm in [
+        ("P/E (Trailing)", sg(info, "trailingPE"), DEC),
+        ("P/E (Forward)", sg(info, "forwardPE"), DEC),
+        ("P/B Ratio", sg(info, "priceToBook"), DEC),
+        ("P/S Ratio", sg(info, "priceToSalesTrailing12Months"), DEC),
+        ("EV/EBITDA", sg(info, "enterpriseToEbitda"), DEC),
+        ("EV/Revenue", sg(info, "enterpriseToRevenue"), DEC),
+        ("PEG Ratio", sg(info, "pegRatio"), DEC),
+        ("Dividend Yield", sg(info, "dividendYield"), PCT),
+    ]:
+        ws.cell(row=row, column=1, value=lb).font = L_FONT
+        ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=v); sd(c, fm); row += 1
+
+    rr = 4
+    ws.merge_cells(f"D{rr}:F{rr}"); ws[f"D{rr}"].value = "COMPANY INFO"; ws[f"D{rr}"].font = S_FONT; rr += 1
+    for lb, v in [
+        ("Sector", sg(info, "sector")), ("Industry", sg(info, "industry")),
+        ("Country", sg(info, "country")), ("Employees", sg(info, "fullTimeEmployees")),
+        ("Website", sg(info, "website")), ("Currency", sg(info, "currency")),
+    ]:
+        ws.cell(row=rr, column=4, value=lb).font = L_FONT
+        ws.cell(row=rr, column=4).border = BDR
+        ws.merge_cells(f"E{rr}:F{rr}")
+        c = ws.cell(row=rr, column=5, value=v); c.font = D_FONT; c.border = BDR; rr += 1
+
+    rr += 1
+    ws.merge_cells(f"D{rr}:F{rr}"); ws[f"D{rr}"].value = "BUSINESS DESCRIPTION"; ws[f"D{rr}"].font = S_FONT; rr += 1
+    desc = sg(info, "longBusinessSummary", "N/A")
+    if isinstance(desc, str) and len(desc) > 500:
+        desc = desc[:500] + "..."
+    ws.merge_cells(f"D{rr}:F{rr+4}")
+    dc = ws.cell(row=rr, column=4, value=desc)
+    dc.font = Font(name="Arial", color="555555", size=9)
+    dc.alignment = Alignment(wrap_text=True, vertical="top")
+
+    if hist is not None and not hist.empty:
+        cr = max(row, rr + 6) + 2
+        ws.cell(row=cr - 1, column=1, value="52-WEEK PRICE CHART").font = S_FONT
+        hr = cr
+        ws.cell(row=hr, column=8, value="Date").font = L_FONT
+        ws.cell(row=hr, column=9, value="Close").font = L_FONT
+        smp = hist["Close"].iloc[::5]
+        for i, (dt, pr) in enumerate(smp.items()):
+            r = hr + 1 + i
+            ws.cell(row=r, column=8, value=dt.strftime("%Y-%m-%d")).font = D_FONT
+            ws.cell(row=r, column=9, value=round(float(pr), 2)).font = D_FONT
+        de = hr + len(smp)
+        ch = LineChart(); ch.title = f"{ticker.upper()} - 52 Week Price"; ch.style = 10
+        ch.y_axis.title = f"Price ({cfmt['code']})"; ch.width = 28; ch.height = 14; ch.legend = None
+        ch.add_data(Reference(ws, min_col=9, min_row=hr, max_row=de), titles_from_data=True)
+        ch.set_categories(Reference(ws, min_col=8, min_row=hr + 1, max_row=de))
+        ch.series[0].graphicalProperties.line.width = 22000
+        ch.series[0].graphicalProperties.line.solidFill = "2E5090"
+        ws.add_chart(ch, f"A{cr}")
+
+    ws.freeze_panes = "A3"
+    for cl, w in [("A", 22), ("B", 18), ("D", 16), ("E", 20), ("F", 20)]:
+        ws.column_dimensions[cl].width = w
+    ws.column_dimensions["H"].hidden = True
+    ws.column_dimensions["I"].hidden = True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SHEET 2: FINANCIAL STATEMENTS
+# ═══════════════════════════════════════════════════════════════════════
+
+def create_financials(wb, stock):
+    ws = wb.create_sheet("Financial Statements"); ws.sheet_properties.tabColor = "2E5090"
+    cr = 1
+    for sn, data in {
+        "INCOME STATEMENT": stock.financials,
+        "BALANCE SHEET": stock.balance_sheet,
+        "CASH FLOW STATEMENT": stock.cashflow,
+    }.items():
+        if data is None or data.empty:
+            ws.cell(row=cr, column=1, value=f"{sn} - No data").font = S_FONT; cr += 3; continue
+        data = data.iloc[:, :5]
+        yrs = [c.strftime("%Y") if hasattr(c, "strftime") else str(c) for c in data.columns]
+        ws.merge_cells(start_row=cr, start_column=1, end_row=cr, end_column=len(yrs) + 1 + max(len(yrs) - 1, 0))
+        ws.cell(row=cr, column=1, value=sn).font = S_FONT; cr += 1
+        hdrs = ["Item"] + yrs
+        yoyh = [f"YoY {yrs[i-1]}/{yrs[i]}" for i in range(1, len(yrs))] if len(yrs) > 1 else []
+        ah = hdrs + yoyh
+        for j, h in enumerate(ah, 1):
+            ws.cell(row=cr, column=j, value=h)
+        sh(ws, cr, len(ah)); cr += 1; ds = cr
+
+        for idx, nm in enumerate(data.index):
+            cl = 1
+            ws.cell(row=cr, column=cl, value=str(nm)).font = L_FONT
+            ws.cell(row=cr, column=cl).border = BDR; cl += 1
+            vals = []
+            for yi in range(len(yrs)):
+                v = data.iloc[idx, yi]
+                if pd.notna(v):
+                    c = ws.cell(row=cr, column=cl, value=float(v)); sd(c, NUM)
+                    vals.append(float(v))
+                else:
+                    ws.cell(row=cr, column=cl, value="-"); vals.append(None)
+                cl += 1
+            for i in range(len(yrs) - 1):
+                nw, ol = vals[i], vals[i + 1]
+                yoy = sdv((nw - ol), abs(ol)) if nw is not None and ol is not None else None
+                c = ws.cell(row=cr, column=cl, value=yoy); sd(c, PCT); cl += 1
+            alt_row(ws, cr, cl - 1)
+            cr += 1
+
+        if yoyh:
+            ys = len(yrs) + 2; ye = ys + len(yoyh) - 1
+            acf(ws, f"{get_column_letter(ys)}{ds}:{get_column_letter(ye)}{cr - 1}")
+        cr += 2
+
+    ws.freeze_panes = "B3"; aw(ws, 14, 25); ws.column_dimensions["A"].width = 35
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SHEET 3: FINANCIAL RATIOS (FIX 1.3 — negative equity guard)
+# ═══════════════════════════════════════════════════════════════════════
+
+def create_ratios(wb, stock, info):
+    ws = wb.create_sheet("Financial Ratios"); ws.sheet_properties.tabColor = "4472C4"
+    inc = stock.financials; bs = stock.balance_sheet
+    if inc is None or bs is None:
+        ws.cell(row=1, column=1, value="Insufficient data").font = S_FONT; return
+
+    yc = min(len(inc.columns), len(bs.columns), 5)
+    yrs = [c.strftime("%Y") if hasattr(c, "strftime") else str(c) for c in inc.columns[:yc]]
+
+    def gv(df, rn, ci):
+        if df is None or df.empty:
+            return None
+        m = [r for r in df.index if rn.lower() in str(r).lower()]
+        if m and ci < len(df.columns):
+            v = df.loc[m[0]].iloc[ci]
+            return float(v) if pd.notna(v) else None
+        return None
+
+    secs = {}
+    neg_equity_years = []
+
+    for i in range(yc):
+        rv = gv(inc, "Total Revenue", i); ni = gv(inc, "Net Income", i)
+        oi = gv(inc, "Operating Income", i) or gv(inc, "EBIT", i)
+        gp = gv(inc, "Gross Profit", i); ebitda = gv(inc, "EBITDA", i)
+        ie = gv(inc, "Interest Expense", i)
+        ta = gv(bs, "Total Assets", i)
+        te = gv(bs, "Stockholders Equity", i) or gv(bs, "Total Equity", i)
+        td = gv(bs, "Total Debt", i) or gv(bs, "Long Term Debt", i)
+        ca = gv(bs, "Current Assets", i)
+        cl_val = gv(bs, "Current Liabilities", i)
+        inv = gv(bs, "Inventory", i) or 0
+        cogs = gv(inc, "Cost Of Revenue", i)
+
+        # FIX 1.3: Guard negative equity
+        if te is not None and te < 0:
+            neg_equity_years.append(yrs[i])
+            roe_val = None  # ROE meaningless with negative equity
+            de_val = None   # D/E meaningless
+            em_val = None   # Equity multiplier meaningless
+        else:
+            roe_val = sdv(ni, te)
+            de_val = sdv(td, te)
+            em_val = sdv(ta, te)
+
+        secs.setdefault("PROFITABILITY", []).append({
+            "ROE": roe_val, "ROA": sdv(ni, ta),
+            "Net Margin": sdv(ni, rv), "Operating Margin": sdv(oi, rv),
+            "Gross Margin": sdv(gp, rv), "EBITDA Margin": sdv(ebitda, rv),
+        })
+        secs.setdefault("LIQUIDITY", []).append({
+            "Current Ratio": sdv(ca, cl_val),
+            "Quick Ratio": sdv((ca - inv) if ca and inv is not None else None, cl_val),
+        })
+        secs.setdefault("LEVERAGE", []).append({
+            "Debt-to-Equity": de_val,
+            "Debt-to-Assets": sdv(td, ta),
+            "Interest Coverage": sdv(oi, abs(ie)) if ie else None,
+            "Equity Multiplier": em_val,
+        })
+        secs.setdefault("EFFICIENCY", []).append({
+            "Asset Turnover": sdv(rv, ta),
+            "Inventory Turnover": sdv(cogs, inv) if inv else None,
+        })
+
+    row = 1
+    ws.merge_cells(f"A{row}:F{row}")
+    ws[f"A{row}"].value = "FINANCIAL RATIOS ANALYSIS"; ws[f"A{row}"].font = T_FONT; row += 2
+
+    # Negative equity warning
+    if neg_equity_years:
+        ws.merge_cells(f"A{row}:F{row}")
+        ws[f"A{row}"].value = f"⚠ Negative equity detected in: {', '.join(neg_equity_years)}. ROE and D/E are N/A for those years."
+        ws[f"A{row}"].font = WARN_FONT; row += 2
+
+    for sn, dl in secs.items():
+        if not dl:
+            continue
+        ws.cell(row=row, column=1, value=sn).font = S_FONT; row += 1
+        hd = ["Ratio"] + yrs
+        for j, h in enumerate(hd, 1):
+            ws.cell(row=row, column=j, value=h)
+        sh(ws, row, len(hd)); row += 1
+        for rn in dl[0].keys():
+            ws.cell(row=row, column=1, value=rn).font = L_FONT
+            ws.cell(row=row, column=1).border = BDR
+            for i in range(yc):
+                v = dl[i].get(rn)
+                c = ws.cell(row=row, column=i + 2, value=v)
+                fm = PCT if "margin" in rn.lower() or rn in ("ROE", "ROA") else DEC
+                sd(c, fm)
+            alt_row(ws, row, yc + 1)
+            row += 1
+        row += 1
+
+    ws.freeze_panes = "B4"; aw(ws, 14, 20); ws.column_dimensions["A"].width = 22
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SHEET 4: VALUATION (DCF) — with proper WACC in display
+# ═══════════════════════════════════════════════════════════════════════
+
+def create_valuation(wb, stock, info):
+    cfmt = get_currency_formats(info)
+    CUR = cfmt["CUR"]; CURM = cfmt["CURM"]
+    ws = wb.create_sheet("Valuation (DCF)"); ws.sheet_properties.tabColor = "548235"
+
+    # Pre-compute DCF to use actual values as defaults (not generic 10%/6%/2.5%)
+    dcf_pre = _compute_dcf(stock, info)
+
+    row = 1
+    ws.merge_cells(f"A{row}:G{row}")
+    ws[f"A{row}"].value = "DCF VALUATION MODEL"; ws[f"A{row}"].font = T_FONT; row += 2
+
+    lfcf = dcf_pre["lfcf"]
+    fcf_note = ""
+    if dcf_pre["fcf_source"] == "estimated_ni":
+        fcf_note = " (estimated: 70% of Net Income)"
+    elif dcf_pre["fcf_source"] == "no_data":
+        fcf_note = " (NO DATA — DCF results unreliable)"
+
+    shr = dcf_pre["shr"]
+    cp = dcf_pre["cp"]
+
+    ws.cell(row=row, column=1, value="ASSUMPTIONS (editable - blue cells)").font = S_FONT; row += 1
+
+    if fcf_note:
+        ws.merge_cells(f"A{row}:D{row}")
+        ws[f"A{row}"].value = f"Note: FCF{fcf_note}"
+        ws[f"A{row}"].font = WARN_FONT if "NO DATA" in fcf_note else NOTE_FONT
+        row += 1
+
+    ac = {}
+    for lb, v, fm in [
+        ("Last FCF", lfcf, CURM),
+        ("FCF Growth Rate (Yr 1-5)", dcf_pre["fcf_growth_1"], PCT),
+        ("FCF Growth Rate (Yr 6-10)", dcf_pre["fcf_growth_2"], PCT),
+        ("Terminal Growth Rate", dcf_pre["terminal_g"], PCT),
+        ("WACC (Discount Rate)", dcf_pre["wacc"], PCT),
+        ("Shares Outstanding", shr, NUM),
+        ("Current Stock Price", cp, CUR),
+    ]:
+        ws.cell(row=row, column=1, value=lb).font = L_FONT
+        ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=v); sd(c, fm, True)
+        ws.cell(row=row, column=3, value="<-- Edit").font = NOTE_FONT
+        ac[lb] = f"B{row}"; row += 1
+
+    fc = ac["Last FCF"]; g1 = ac["FCF Growth Rate (Yr 1-5)"]
+    g2 = ac["FCF Growth Rate (Yr 6-10)"]; tg = ac["Terminal Growth Rate"]
+    wc = ac["WACC (Discount Rate)"]; sc = ac["Shares Outstanding"]
+    pc = ac["Current Stock Price"]
+
+    row += 1
+    ws.cell(row=row, column=1, value="PROJECTED FREE CASH FLOWS").font = S_FONT; row += 1
+    for j, h in enumerate(["Year", "FCF", "Discount Factor", "PV of FCF"], 1):
+        ws.cell(row=row, column=j, value=h)
+    sh(ws, row, 4); row += 1; ps = row
+
+    for yr in range(1, 11):
+        ws.cell(row=row, column=1, value=f"Year {yr}").font = L_FONT
+        ws.cell(row=row, column=1).border = BDR
+        g = g1 if yr <= 5 else g2
+        ff = f"={fc}*(1+{g})" if yr == 1 else f"=B{row-1}*(1+{g})"
+        c = ws.cell(row=row, column=2, value=ff); sd(c, NUM)
+        c = ws.cell(row=row, column=3, value=f"=1/(1+{wc})^({yr}-0.5)"); sd(c, '0.0000')
+        c = ws.cell(row=row, column=4, value=f"=B{row}*C{row}"); sd(c, NUM)
+        row += 1
+
+    pe = row - 1; row += 1
+    ws.cell(row=row, column=1, value="VALUATION SUMMARY").font = S_FONT; row += 1
+    tr = row
+    ws.cell(row=row, column=1, value="Terminal Value").font = L_FONT; ws.cell(row=row, column=1).border = BDR
+    c = ws.cell(row=row, column=2, value=f"=B{pe}*(1+{tg})/({wc}-{tg})"); sd(c, NUM); row += 1
+    pr = row
+    ws.cell(row=row, column=1, value="PV of Terminal Value").font = L_FONT; ws.cell(row=row, column=1).border = BDR
+    c = ws.cell(row=row, column=2, value=f"=B{tr}/(1+{wc})^10"); sd(c, NUM); row += 1
+    sr = row
+    ws.cell(row=row, column=1, value="Sum of PV of FCFs").font = L_FONT; ws.cell(row=row, column=1).border = BDR
+    c = ws.cell(row=row, column=2, value=f"=SUM(D{ps}:D{pe})"); sd(c, NUM); row += 1
+    er = row
+    ws.cell(row=row, column=1, value="Enterprise Value").font = L_FONT; ws.cell(row=row, column=1).border = BDR
+    c = ws.cell(row=row, column=2, value=f"=B{sr}+B{pr}"); sd(c, NUM)
+    c.font = Font(name="Arial", bold=True, color="333333", size=11); row += 1
+
+    # Net Debt Bridge — FCF is FCFF, so DCF gives Enterprise Value, not Equity Value
+    ws.cell(row=row, column=1, value="NET DEBT BRIDGE").font = S_FONT; row += 1
+    # Total Debt
+    td_val = _get_financial_val(stock, "balance_sheet", ["Total Debt", "Long Term Debt"], 0) or 0
+    ws.cell(row=row, column=1, value="(-) Total Debt").font = L_FONT; ws.cell(row=row, column=1).border = BDR
+    tdr = row
+    c = ws.cell(row=row, column=2, value=td_val); sd(c, NUM); row += 1
+    # Cash
+    cash_val = _get_financial_val(stock, "balance_sheet",
+        ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments", "Cash Financial"], 0) or 0
+    ws.cell(row=row, column=1, value="(+) Cash & Equivalents").font = L_FONT; ws.cell(row=row, column=1).border = BDR
+    cr_cash = row
+    c = ws.cell(row=row, column=2, value=cash_val); sd(c, NUM); row += 1
+    # Equity Value = EV - Debt + Cash
+    eqr = row
+    ws.cell(row=row, column=1, value="Equity Value").font = L_FONT; ws.cell(row=row, column=1).border = BDR
+    c = ws.cell(row=row, column=2, value=f"=B{er}-B{tdr}+B{cr_cash}"); sd(c, NUM)
+    c.font = Font(name="Arial", bold=True, color="333333", size=11); row += 1
+
+    ir = row
+    ws.cell(row=row, column=1, value="Intrinsic Value / Share").font = Font(name="Arial", bold=True, color="006100", size=11)
+    ws.cell(row=row, column=1).border = BDR; ws.cell(row=row, column=1).fill = GREEN_BG
+    c = ws.cell(row=row, column=2, value=f"=B{eqr}/{sc}"); sd(c, CUR)
+    c.font = Font(name="Arial", bold=True, color="006100", size=12); c.fill = GREEN_BG; row += 1
+    ws.cell(row=row, column=1, value="Margin of Safety").font = Font(name="Arial", bold=True, color="2E5090", size=11)
+    ws.cell(row=row, column=1).border = BDR
+    c = ws.cell(row=row, column=2, value=f"=(B{ir}-{pc})/{pc}"); sd(c, PCT)
+    c.font = Font(name="Arial", bold=True, size=12); acf(ws, f"B{row}:B{row}"); row += 2
+
+    ws.cell(row=row, column=1, value="PEER COMPARISON (Multiples)").font = S_FONT; row += 1
+    for j, h in enumerate(["Metric", "Company", "Sector Avg (edit)"], 1):
+        ws.cell(row=row, column=j, value=h)
+    sh(ws, row, 3); row += 1
+    for lb, v in [
+        ("P/E Ratio", sg(info, "trailingPE")),
+        ("P/B Ratio", sg(info, "priceToBook")),
+        ("EV/EBITDA", sg(info, "enterpriseToEbitda")),
+        ("EV/Revenue", sg(info, "enterpriseToRevenue")),
+        ("P/S Ratio", sg(info, "priceToSalesTrailing12Months")),
+    ]:
+        ws.cell(row=row, column=1, value=lb).font = L_FONT; ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=v); sd(c, DEC)
+        c = ws.cell(row=row, column=3, value="N/A"); sd(c, DEC, True); row += 1
+
+    ws.freeze_panes = "A3"; aw(ws, 14, 22)
+    ws.column_dimensions["A"].width = 28; ws.column_dimensions["B"].width = 20
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SHEET 5: TECHNICAL ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
+
+def create_technical(wb, ticker, hist, info):
+    cfmt = get_currency_formats(info)
+    ws = wb.create_sheet("Technical Analysis"); ws.sheet_properties.tabColor = "BF8F00"
+    if hist is None or hist.empty:
+        ws.cell(row=1, column=1, value="No data").font = S_FONT; return
+
+    row = 1
+    ws.merge_cells(f"A{row}:H{row}")
+    ws[f"A{row}"].value = f"TECHNICAL ANALYSIS - {ticker.upper()}"
+    ws[f"A{row}"].font = T_FONT; row += 2
+
+    cl_s = hist["Close"].copy()
+    s50 = cl_s.rolling(50).mean(); s200 = cl_s.rolling(200).mean()
+    d = cl_s.diff(); gn = d.clip(lower=0); ls = (-d.clip(upper=0))
+    ag = gn.rolling(14).mean(); al = ls.rolling(14).mean()
+    rs = ag / al; rsi = 100 - (100 / (1 + rs))
+    e12 = cl_s.ewm(span=12, adjust=False).mean()
+    e26 = cl_s.ewm(span=26, adjust=False).mean()
+    ml = e12 - e26; sl_m = ml.ewm(span=9, adjust=False).mean(); mh = ml - sl_m
+
+    hds = ["Date", "Close", "SMA 50", "SMA 200", "RSI (14)", "MACD", "Signal", "MACD Hist"]
+    for j, h in enumerate(hds, 1):
+        ws.cell(row=row, column=j, value=h)
+    sh(ws, row, len(hds)); row += 1; ds = row
+
+    for i in range(len(hist)):
+        dt = hist.index[i]
+        ws.cell(row=row, column=1, value=dt.strftime("%Y-%m-%d")).font = D_FONT
+        ws.cell(row=row, column=1).border = BDR
+        for j, s in enumerate([cl_s, s50, s200, rsi, ml, sl_m, mh], 2):
+            v = s.iloc[i]
+            c = ws.cell(row=row, column=j, value=float(v) if pd.notna(v) else None); sd(c, DEC)
+        alt_row(ws, row, 8)
+        row += 1
+
+    de = row - 1
+    cr = Reference(ws, min_col=1, min_row=ds, max_row=de)
+    ch = LineChart(); ch.title = f"{ticker.upper()} - Price & MAs"; ch.style = 10
+    ch.width = 30; ch.height = 15; ch.y_axis.title = f"Price ({cfmt['code']})"
+    for ci in [2, 3, 4]:
+        ch.add_data(Reference(ws, min_col=ci, min_row=ds - 1, max_row=de), titles_from_data=True)
+    ch.set_categories(cr)
+    for idx, s in enumerate(ch.series):
+        s.graphicalProperties.line.width = 18000 if idx == 0 else 14000
+        s.graphicalProperties.line.solidFill = ["2E5090", "E67E22", "C0392B"][idx]
+    ws.add_chart(ch, "J3")
+
+    rc = LineChart(); rc.title = "RSI (14)"; rc.style = 10; rc.width = 30; rc.height = 10
+    rc.y_axis.scaling.min = 0; rc.y_axis.scaling.max = 100
+    rc.add_data(Reference(ws, min_col=5, min_row=ds - 1, max_row=de), titles_from_data=True)
+    rc.set_categories(cr); rc.series[0].graphicalProperties.line.solidFill = "8E44AD"
+    ws.add_chart(rc, "J20")
+
+    mc = BarChart(); mc.title = "MACD Histogram"; mc.style = 10; mc.width = 30; mc.height = 10
+    mc.add_data(Reference(ws, min_col=8, min_row=ds - 1, max_row=de), titles_from_data=True)
+    mc.set_categories(cr)
+    ws.add_chart(mc, "J35")
+
+    ws.freeze_panes = "B4"; aw(ws, 12, 16); ws.column_dimensions["A"].width = 14
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SHEET 6: DIVIDENDS (FIX 1.6 — CAGR edge cases)
+# ═══════════════════════════════════════════════════════════════════════
+
+def create_dividends(wb, stock, info):
+    cfmt = get_currency_formats(info)
+    CUR = cfmt["CUR"]
+    ws = wb.create_sheet("Dividends"); ws.sheet_properties.tabColor = "548235"
+
+    row = 1
+    ws.merge_cells(f"A{row}:E{row}")
+    ws[f"A{row}"].value = "DIVIDEND ANALYSIS"; ws[f"A{row}"].font = T_FONT; row += 2
+
+    ws.cell(row=row, column=1, value="DIVIDEND SUMMARY").font = S_FONT; row += 1
+    exd = sg(info, "exDividendDate")
+    if isinstance(exd, (int, float)) and exd != "N/A":
+        try:
+            exd = datetime.datetime.fromtimestamp(exd).strftime("%Y-%m-%d")
+        except:
+            exd = "N/A"
+
+    for lb, v, fm in [
+        ("Annual Div Rate (/sh)", sg(info, "dividendRate", 0), CUR),
+        ("Dividend Yield", sg(info, "dividendYield", 0), PCT),
+        ("Payout Ratio", sg(info, "payoutRatio", 0), PCT),
+        ("Ex-Dividend Date", exd, None),
+        ("5-Yr Avg Yield", sg(info, "fiveYearAvgDividendYield", "N/A"), '0.00"%"'),
+    ]:
+        ws.cell(row=row, column=1, value=lb).font = L_FONT
+        ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=v)
+        if fm:
+            sd(c, fm)
+        else:
+            c.font = D_FONT; c.border = BDR
+        row += 1
+
+    row += 2
+    dvs = stock.dividends
+    if dvs is not None and not dvs.empty:
+        ws.cell(row=row, column=1, value="DIVIDEND HISTORY (last 20)").font = S_FONT; row += 1
+        for j, h in enumerate(["Date", f"Dividend (/sh)"], 1):
+            ws.cell(row=row, column=j, value=h)
+        sh(ws, row, 2); row += 1
+        for dt, am in dvs.tail(20).items():
+            ws.cell(row=row, column=1, value=dt.strftime("%Y-%m-%d")).font = D_FONT
+            ws.cell(row=row, column=1).border = BDR
+            c = ws.cell(row=row, column=2, value=float(am)); sd(c, CUR)
+            alt_row(ws, row, 2)
+            row += 1
+
+        # FIX 1.6: Dividend CAGR with proper edge case handling
+        if len(dvs) >= 8:
+            ann = dvs.resample("YE").sum()
+            if len(ann) >= 2:
+                f_val = float(ann.iloc[0]); l_val = float(ann.iloc[-1]); n = len(ann) - 1
+                row += 1
+                if f_val > 0 and l_val > 0 and n > 0:
+                    cagr = (l_val / f_val) ** (1 / n) - 1
+                    ws.cell(row=row, column=1, value="Dividend CAGR").font = Font(name="Arial", bold=True, color="006100", size=11)
+                    ws.cell(row=row, column=1).fill = GREEN_BG; ws.cell(row=row, column=1).border = BDR
+                    c = ws.cell(row=row, column=2, value=cagr); sd(c, PCT)
+                    c.fill = GREEN_BG; c.font = Font(name="Arial", bold=True, color="006100", size=11)
+                elif f_val == 0 and l_val > 0:
+                    ws.cell(row=row, column=1, value="Dividend CAGR").font = L_FONT
+                    ws.cell(row=row, column=1).border = BDR
+                    c = ws.cell(row=row, column=2, value="New program (no base year)")
+                    c.font = NOTE_FONT; c.border = BDR
+                elif l_val == 0:
+                    ws.cell(row=row, column=1, value="Dividend CAGR").font = L_FONT
+                    ws.cell(row=row, column=1).border = BDR
+                    c = ws.cell(row=row, column=2, value="Dividend suspended")
+                    c.font = WARN_FONT; c.border = BDR
+    else:
+        ws.cell(row=row, column=1, value="This company does not pay dividends.").font = Font(
+            name="Arial", color="999999", size=11, italic=True)
+
+    ws.freeze_panes = "A3"; aw(ws, 14, 22); ws.column_dimensions["A"].width = 28
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SHEET 7: RISK & SENTIMENT
+# ═══════════════════════════════════════════════════════════════════════
+
+def create_risk(wb, stock, info, hist):
+    cfmt = get_currency_formats(info)
+    CUR = cfmt["CUR"]
+    ws = wb.create_sheet("Risk & Sentiment"); ws.sheet_properties.tabColor = "C00000"
+
+    row = 1
+    ws.merge_cells(f"A{row}:D{row}")
+    ws[f"A{row}"].value = "RISK & SENTIMENT ANALYSIS"; ws[f"A{row}"].font = T_FONT; row += 2
+
+    ws.cell(row=row, column=1, value="RISK METRICS").font = S_FONT; row += 1
+    av = None; sp = None
+    if hist is not None and not hist.empty:
+        ret = hist["Close"].pct_change().dropna()
+        if len(ret) > 20:
+            av = float(ret.std() * np.sqrt(252))
+            ar = float(ret.mean() * 252)
+            sp = (ar - 0.04) / av if av > 0 else None
+
+    rd = [
+        ("Beta", sg(info, "beta", "N/A"), DEC),
+        ("Annual Volatility", av, PCT),
+        ("Sharpe Ratio (vs Rf=4%)", sp, DEC),
+        ("52-Week High", sg(info, "fiftyTwoWeekHigh"), CUR),
+        ("52-Week Low", sg(info, "fiftyTwoWeekLow"), CUR),
+    ]
+    h = info.get("fiftyTwoWeekHigh"); l = info.get("fiftyTwoWeekLow"); p = info.get("currentPrice")
+    if h and l and p and h != l:
+        rd.append(("% from 52W High", (p - h) / h, PCT))
+        rd.append(("% from 52W Low", (p - l) / l, PCT))
+
+    for lb, v, fm in rd:
+        ws.cell(row=row, column=1, value=lb).font = L_FONT; ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=v); sd(c, fm); row += 1
+
+    row += 2
+    ws.cell(row=row, column=1, value="MARKET SENTIMENT").font = S_FONT; row += 1
+    for lb, v, fm in [
+        ("Short Ratio", sg(info, "shortRatio"), DEC),
+        ("Short % of Float", sg(info, "shortPercentOfFloat"), PCT),
+        ("Recommendation", sg(info, "recommendationKey", "N/A"), None),
+        ("Recommendation Score", sg(info, "recommendationMean"), DEC),
+        ("Target High", sg(info, "targetHighPrice"), CUR),
+        ("Target Low", sg(info, "targetLowPrice"), CUR),
+        ("Target Mean", sg(info, "targetMeanPrice"), CUR),
+        ("Target Median", sg(info, "targetMedianPrice"), CUR),
+        ("# of Analysts", sg(info, "numberOfAnalystOpinions"), NUM),
+    ]:
+        ws.cell(row=row, column=1, value=lb).font = L_FONT; ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=v)
+        if fm:
+            sd(c, fm)
+        else:
+            c.font = D_FONT; c.border = BDR; c.alignment = Alignment(horizontal="center")
+        row += 1
+
+    row += 2
+    if p and info.get("targetMeanPrice"):
+        ws.cell(row=row, column=1, value="UPSIDE / DOWNSIDE").font = S_FONT; row += 1
+        t = info["targetMeanPrice"]; u = (t - p) / p
+        ws.cell(row=row, column=1, value="Expected Return to Target").font = Font(
+            name="Arial", bold=True, color="2E5090", size=11)
+        ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=u); sd(c, PCT)
+        c.font = Font(name="Arial", bold=True, size=12); acf(ws, f"B{row}:B{row}")
+
+    ws.freeze_panes = "A3"; aw(ws, 14, 22); ws.column_dimensions["A"].width = 28
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# DCF COMPUTATION ENGINE (COMPLETE REWRITE — FIX 1.1, 1.2, 1.7, 1.8)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _compute_dcf(stock, info, wacc_override=None, g1_override=None,
+                 g2_override=None, tg_override=None):
+    """
+    Compute DCF intrinsic value with proper WACC, beta clamping,
+    country risk premium, effective tax rate, and FCF fallbacks.
+    """
+    cf = stock.cashflow
+    lfcf = None
+    fcf_history = []
+    fcf_source = "direct"
+
+    if cf is not None and not cf.empty:
+        # Try FCF row directly
+        fr = [r for r in cf.index if "free cash flow" in str(r).lower()]
+        if fr:
+            for ci in range(min(len(cf.columns), 5)):
+                v = cf.loc[fr[0]].iloc[ci]
+                if pd.notna(v):
+                    fcf_history.append(float(v))
+            if fcf_history:
+                lfcf = fcf_history[0]
+
+        # Fallback: OCF + CapEx (CapEx is typically negative in yfinance)
+        if lfcf is None:
+            opr = [r for r in cf.index if "operating" in str(r).lower() and "cash" in str(r).lower()]
+            cxr = [r for r in cf.index if "capital expenditure" in str(r).lower()]
+            if opr and cxr:
+                fcf_source = "ocf_capex"
+                for ci in range(min(len(cf.columns), 5)):
+                    op = cf.loc[opr[0]].iloc[ci]; cx = cf.loc[cxr[0]].iloc[ci]
+                    if pd.notna(op) and pd.notna(cx):
+                        fcf_history.append(float(op) + float(cx))
+                if fcf_history:
+                    lfcf = fcf_history[0]
+
+    # FIX 1.2: Better fallback — estimate from Net Income
+    if lfcf is None or lfcf == 0:
+        ni_val = _get_financial_val(stock, "financials", ["Net Income"], 0)
+        if ni_val and ni_val > 0:
+            lfcf = ni_val * 0.70
+            fcf_source = "estimated_ni"
+        elif lfcf is None:
+            lfcf = 0
+            fcf_source = "no_data"
+
+    # ═══ WACC COMPUTATION (FIX 1.1 — proper WACC, not just cost of equity) ═══
+    country = info.get("country", "United States")
+    rf = 0.042  # 10Y US Treasury proxy (2025 vintage)
+    erp_base = 0.055  # Damodaran US ERP
+    crp = COUNTRY_CRP.get(country, 0.01)
+    erp = erp_base + crp
+
+    # FIX 1.7: Beta clamping
+    beta = info.get("beta")
+    if beta and isinstance(beta, (int, float)) and not pd.isna(beta):
+        beta = max(0.3, min(beta, 3.0))  # clamp to reasonable range
+    else:
+        beta = 1.0  # market average fallback
+
+    re = rf + beta * erp  # Cost of Equity (CAPM)
+
+    # Cost of Debt
+    market_cap = info.get("marketCap", 0) or 0
+    total_debt = _get_financial_val(stock, "balance_sheet",
+                                     ["Total Debt", "Long Term Debt"], 0)
+    interest_expense = _get_financial_val(stock, "financials",
+                                           ["Interest Expense"], 0)
+
+    tax_rate = _get_tax_rate(stock, info)
+
+    # Full WACC calculation
+    if total_debt and total_debt > 0 and market_cap and market_cap > 0:
+        # Cost of debt
+        if interest_expense and total_debt > 0:
+            rd = abs(interest_expense) / total_debt
+            rd = max(0.01, min(rd, 0.20))  # clamp 1%-20%
+        else:
+            rd = rf + 0.02  # 200bps spread over risk-free
+
+        total_capital = market_cap + total_debt
+        wacc = (market_cap / total_capital) * re + \
+               (total_debt / total_capital) * rd * (1 - tax_rate)
+        wacc = max(wacc, 0.04)  # floor at 4%
+        wacc_method = "full_wacc"
+    else:
+        wacc = re  # fallback to cost of equity
+        wacc_method = "cost_of_equity_only"
+        rd = None
+
+    if wacc_override is not None:
+        wacc = wacc_override
+
+    # ═══ FCF GROWTH RATES ═══
+    sector = info.get("sector", "")
+    sbm = SECTOR_BENCHMARKS.get(sector, DEFAULT_SECTOR)
+
+    fcf_growth_1 = 0.10  # default
+    if len(fcf_history) >= 2:
+        first_fcf = fcf_history[-1]; last_fcf_hist = fcf_history[0]
+        n = len(fcf_history) - 1
+        if first_fcf > 0 and last_fcf_hist > 0 and n > 0:
+            cagr = (last_fcf_hist / first_fcf) ** (1 / n) - 1
+            fcf_growth_1 = max(min(cagr, sbm["growth_cap"]), sbm["growth_floor"])
+
+    if g1_override is not None:
+        fcf_growth_1 = g1_override
+
+    fcf_growth_2 = fcf_growth_1 * 0.6 if g2_override is None else g2_override
+    terminal_g = sbm["terminal_g"] if tg_override is None else tg_override
+
+    shr = _get_shares(info)
+    cp = info.get("currentPrice", 0) or 0
+
+    # ═══ PROJECT FCFs ═══
+    projected_fcfs = []
+    fcf_val = lfcf
+    for yr in range(1, 11):
+        g = fcf_growth_1 if yr <= 5 else fcf_growth_2
+        fcf_val = fcf_val * (1 + g)
+        projected_fcfs.append(fcf_val)
+
+    # ═══ DISCOUNT (mid-year convention) ═══
+    # Cash flows arrive throughout the year, not at year-end.
+    # Standard IB practice: discount at (yr - 0.5) for FCFs.
+    pv_fcfs = sum(f / (1 + wacc) ** (yr - 0.5) for yr, f in enumerate(projected_fcfs, 1))
+
+    # Terminal value — point-in-time at end of year 10, discounted full 10 years
+    if wacc > terminal_g and projected_fcfs:
+        tv = projected_fcfs[-1] * (1 + terminal_g) / (wacc - terminal_g)
+        pv_tv = tv / (1 + wacc) ** 10
+    else:
+        tv = 0; pv_tv = 0
+
+    enterprise_value = pv_fcfs + pv_tv
+
+    # ═══ NET DEBT BRIDGE ═══
+    # FCF (yfinance) = FCFF (Free Cash Flow to Firm) → discounted at WACC → Enterprise Value
+    # Equity Value = Enterprise Value - Total Debt + Cash
+    cash = _get_financial_val(stock, "balance_sheet",
+                               ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments",
+                                "Cash Financial"], 0) or 0
+    net_debt = (total_debt or 0) - cash
+    equity_value = enterprise_value - net_debt
+    intrinsic = equity_value / shr if shr else 0
+
+    # Handle zero/negative price
+    if cp and cp > 0:
+        mos = (intrinsic - cp) / cp
+    else:
+        mos = 0
+
+    return {
+        "lfcf": lfcf, "fcf_history": fcf_history, "fcf_source": fcf_source,
+        "wacc": wacc, "wacc_method": wacc_method, "rf": rf, "erp": erp,
+        "erp_base": erp_base, "crp": crp, "beta": beta, "re": re,
+        "rd": rd, "tax_rate": tax_rate,
+        "total_debt": total_debt, "market_cap": market_cap,
+        "cash": cash, "net_debt": net_debt,
+        "fcf_growth_1": fcf_growth_1, "fcf_growth_2": fcf_growth_2,
+        "terminal_g": terminal_g, "shr": shr, "cp": cp,
+        "projected_fcfs": projected_fcfs,
+        "pv_fcfs": pv_fcfs, "pv_tv": pv_tv, "tv": tv,
+        "enterprise_value": enterprise_value,
+        "equity_value": equity_value,
+        "intrinsic": intrinsic, "mos": mos,
+        "sector_benchmarks": sbm,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MULTI-SCENARIO DCF (NEW — FIX 3.1)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _compute_scenarios(stock, info, base_dcf):
+    """Compute Bull / Base / Bear scenarios with probability-weighted fair value."""
+    scenarios = {
+        "Bull": {"g1_mult": 1.3, "wacc_adj": -0.01, "tg_adj": +0.005, "prob": 0.25},
+        "Base": {"g1_mult": 1.0, "wacc_adj": 0.0,   "tg_adj": 0.0,   "prob": 0.50},
+        "Bear": {"g1_mult": 0.5, "wacc_adj": +0.02, "tg_adj": -0.005, "prob": 0.25},
+    }
+    results = {}
+    weighted_iv = 0
+
+    for name, adj in scenarios.items():
+        g1 = base_dcf["fcf_growth_1"] * adj["g1_mult"]
+        g2 = g1 * 0.6
+        w = base_dcf["wacc"] + adj["wacc_adj"]
+        tg = base_dcf["terminal_g"] + adj["tg_adj"]
+
+        # Ensure wacc > terminal_g
+        if w <= tg:
+            w = tg + 0.02
+
+        dcf = _compute_dcf(stock, info, wacc_override=w, g1_override=g1,
+                           g2_override=g2, tg_override=tg)
+        iv = dcf["intrinsic"]
+        results[name] = {
+            "intrinsic": iv,
+            "mos": dcf["mos"],
+            "wacc": w, "g1": g1, "tg": tg,
+            "prob": adj["prob"],
+        }
+        weighted_iv += iv * adj["prob"]
+
+    return results, weighted_iv
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SENSITIVITY ANALYSIS (NEW — FIX 3.3)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _write_sensitivity_table(ws, row, base_dcf, stock, info):
+    """Write WACC x Terminal Growth sensitivity matrix to sheet."""
+    cfmt = get_currency_formats(info)
+    CUR = cfmt["CUR"]
+
+    ws.merge_cells(f"A{row}:G{row}")
+    ws[f"A{row}"].value = "SENSITIVITY ANALYSIS (Intrinsic Value / Share)"
+    ws[f"A{row}"].font = S_FONT; row += 2
+
+    wacc_deltas = [-0.02, -0.01, 0, 0.01, 0.02]
+    tg_deltas = [-0.010, -0.005, 0, 0.005, 0.010]
+
+    # Corner label
+    ws.cell(row=row, column=1, value="WACC ↓ \\ Tg →").font = L_FONT
+    ws.cell(row=row, column=1).border = BDR
+
+    # Column headers (terminal growth)
+    for j, td in enumerate(tg_deltas):
+        tg_val = base_dcf["terminal_g"] + td
+        c = ws.cell(row=row, column=j + 2, value=tg_val); sd(c, PCT)
+        c.font = H_FONT; c.fill = ACCENT
+    row += 1
+
+    cp = base_dcf["cp"]
+
+    for wd in wacc_deltas:
+        w_val = base_dcf["wacc"] + wd
+        c = ws.cell(row=row, column=1, value=w_val); sd(c, PCT); c.font = L_FONT
+
+        for j, td in enumerate(tg_deltas):
+            tg_val = base_dcf["terminal_g"] + td
+            if w_val <= tg_val:
+                ws.cell(row=row, column=j + 2, value="N/A").font = D_FONT
+                ws.cell(row=row, column=j + 2).border = BDR
+                continue
+
+            dcf = _compute_dcf(stock, info, wacc_override=w_val, tg_override=tg_val)
+            iv = dcf["intrinsic"]
+            c = ws.cell(row=row, column=j + 2, value=iv); sd(c, CUR)
+
+            # Color coding by margin of safety
+            if cp and cp > 0:
+                mos = (iv - cp) / cp
+                if mos > 0.20:
+                    c.fill = GREEN_BG
+                elif mos < -0.10:
+                    c.fill = RED_BG
+                else:
+                    c.fill = YELLOW_BG
+
+            # Highlight the base case cell
+            if wd == 0 and td == 0:
+                c.font = Font(name="Arial", bold=True, color="1B2A4A", size=11)
+                c.border = Border(
+                    left=Side(style="medium", color="1B2A4A"),
+                    right=Side(style="medium", color="1B2A4A"),
+                    top=Side(style="medium", color="1B2A4A"),
+                    bottom=Side(style="medium", color="1B2A4A"),
+                )
+
+        row += 1
+
+    # Legend
+    row += 1
+    ws.merge_cells(f"A{row}:G{row}")
+    ws[f"A{row}"].value = "Green = >20% upside (BUY zone) | Yellow = ±20% (HOLD zone) | Red = >10% downside (SELL zone) | Bold = Base case"
+    ws[f"A{row}"].font = NOTE_FONT
+    return row + 2
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SHEET 8: INVESTMENT VERDICT (COMPLETE REWRITE)
+# ═══════════════════════════════════════════════════════════════════════
+
+def create_investment_verdict(wb, stock, info, hist):
+    cfmt = get_currency_formats(info)
+    CUR = cfmt["CUR"]; CURM = cfmt["CURM"]
+    ws = wb.create_sheet("Investment Verdict"); ws.sheet_properties.tabColor = "4A148C"
+
+    # ── Compute all data ──
+    dcf = _compute_dcf(stock, info)
+    intrinsic = dcf["intrinsic"]; cp = dcf["cp"]; mos = dcf["mos"]
+    wacc = dcf["wacc"]; lfcf = dcf["lfcf"]
+    sbm = dcf["sector_benchmarks"]
+
+    # Multi-scenario
+    scenarios, weighted_iv = _compute_scenarios(stock, info, dcf)
+
+    # Use weighted IV for verdict (more robust than single-scenario)
+    if cp and cp > 0:
+        weighted_mos = (weighted_iv - cp) / cp
+    else:
+        weighted_mos = 0
+
+    # Financial data
+    rev0 = _get_financial_val(stock, "financials", ["Total Revenue"], 0)
+    rev1 = _get_financial_val(stock, "financials", ["Total Revenue"], 1)
+    ni = _get_financial_val(stock, "financials", ["Net Income"], 0)
+    oi = _get_financial_val(stock, "financials", ["Operating Income", "EBIT"], 0)
+    gp = _get_financial_val(stock, "financials", ["Gross Profit"], 0)
+    ta = _get_financial_val(stock, "balance_sheet", ["Total Assets"], 0)
+    te = _get_financial_val(stock, "balance_sheet", ["Stockholders Equity", "Total Equity"], 0)
+    td = _get_financial_val(stock, "balance_sheet", ["Total Debt", "Long Term Debt"], 0)
+    ca = _get_financial_val(stock, "balance_sheet", ["Current Assets"], 0)
+    clb = _get_financial_val(stock, "balance_sheet", ["Current Liabilities"], 0)
+    cash = _get_financial_val(stock, "balance_sheet", ["Cash And Cash Equivalents"], 0)
+
+    rev_growth = (rev0 - rev1) / abs(rev1) if rev0 and rev1 and rev1 != 0 else None
+    gross_margin = gp / rev0 if gp and rev0 and rev0 != 0 else None
+    net_margin = ni / rev0 if ni and rev0 and rev0 != 0 else None
+    roe = ni / te if ni and te and te > 0 else None  # FIX 1.3: guard negative equity
+    de_ratio = td / te if td and te and te > 0 else None  # FIX 1.3
+    current_ratio = ca / clb if ca and clb and clb != 0 else None
+    fcf_margin = lfcf / rev0 if lfcf and rev0 and rev0 != 0 else None
+    net_debt = (td or 0) - (cash or 0)
+
+    gp1 = _get_financial_val(stock, "financials", ["Gross Profit"], 1)
+    rev1v = _get_financial_val(stock, "financials", ["Total Revenue"], 1)
+    gm_prev = gp1 / rev1v if gp1 and rev1v and rev1v != 0 else None
+
+    # ════════════════════════════════════════════════
+    # SECTION A: VERDICT
+    # ════════════════════════════════════════════════
+    row = 1
+    ws.merge_cells("A1:G2")
+    c = ws["A1"]
+    c.value = f"INVESTMENT VERDICT: {info.get('shortName', 'N/A')} ({cfmt['code']})"
+    c.font = Font(name="Arial", bold=True, color="1B2A4A", size=16)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 25; ws.row_dimensions[2].height = 25
+
+    row = 4
+    ws.merge_cells("A4:B5")
+    vc = ws["A4"]
+
+    # FIX: Check if DCF data is available
+    dcf_available = dcf["fcf_source"] != "no_data"
+
+    if not dcf_available:
+        vc.value = "N/A"
+        vc.fill = PatternFill("solid", fgColor="808080")
+        vc.font = Font(name="Arial", bold=True, color="FFFFFF", size=20)
+        ws.cell(row=4, column=3, value="Insufficient data for DCF valuation").font = WARN_FONT
+    else:
+        # FIX 2.2: Stricter, symmetric thresholds using weighted MoS
+        if weighted_mos > 0.30:
+            vc.value = "STRONG BUY"; vc.fill = PatternFill("solid", fgColor="004D00")
+            vc.font = Font(name="Arial", bold=True, color="FFFFFF", size=20)
+        elif weighted_mos > 0.15:
+            vc.value = "BUY"; vc.fill = PatternFill("solid", fgColor="006100")
+            vc.font = Font(name="Arial", bold=True, color="FFFFFF", size=20)
+        elif weighted_mos > -0.15:
+            vc.value = "HOLD"; vc.fill = PatternFill("solid", fgColor="BF8F00")
+            vc.font = Font(name="Arial", bold=True, color="FFFFFF", size=20)
+        elif weighted_mos > -0.30:
+            vc.value = "SELL"; vc.fill = PatternFill("solid", fgColor="C00000")
+            vc.font = Font(name="Arial", bold=True, color="FFFFFF", size=20)
+        else:
+            vc.value = "STRONG SELL"; vc.fill = PatternFill("solid", fgColor="800000")
+            vc.font = Font(name="Arial", bold=True, color="FFFFFF", size=20)
+
+        ws.cell(row=4, column=3, value="Probability-weighted DCF verdict").font = NOTE_FONT
+
+    vc.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[4].height = 22; ws.row_dimensions[5].height = 22
+
+    # ── Confidence level ──
+    fcf_hist = dcf["fcf_history"]
+    n_years = len(fcf_hist)
+    fcf_std = None
+    if len(fcf_hist) >= 2:
+        mean_fcf = np.mean(fcf_hist)
+        if mean_fcf != 0:
+            fcf_std = np.std(fcf_hist) / abs(mean_fcf)
+
+    if n_years >= 4 and dcf["beta"] is not None and (fcf_std is None or fcf_std < 0.30):
+        confidence = "High"
+    elif n_years >= 2:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+
+    if dcf["fcf_source"] in ("estimated_ni", "no_data"):
+        confidence = "Low"  # Force low confidence for estimated FCF
+
+    # ── Risk level (FIX 2.2: sector-aware) ──
+    beta_val = dcf["beta"]
+    risk_score = 0
+    if beta_val is not None and beta_val > 1.5:
+        risk_score += 2
+    elif beta_val is not None and beta_val > 1.2:
+        risk_score += 1
+
+    de_thresh = sbm.get("de_threshold")
+    if de_ratio is not None and de_thresh is not None:
+        if de_ratio > de_thresh * 1.5:
+            risk_score += 2
+        elif de_ratio > de_thresh:
+            risk_score += 1
+
+    if lfcf is not None and lfcf < 0:
+        risk_score += 2
+
+    if risk_score >= 3:
+        risk = "High"
+    elif risk_score >= 1:
+        risk = "Medium"
+    else:
+        risk = "Low"
+
+    # Investment horizon
+    if weighted_mos > 0.30:
+        horizon = "Long-term (3+ years)"
+    elif weighted_mos > 0.10:
+        horizon = "Medium-term (1-3 years)"
+    else:
+        horizon = "Short-term (< 1 year)"
+
+    # ── Summary table ──
+    row = 7
+    summary_data = [
+        ("Weighted Fair Value (3 scenarios)", weighted_iv, CUR),
+        ("Base Case Intrinsic Value", intrinsic, CUR),
+        ("Current Price", cp, CUR),
+        ("Weighted Upside / Downside", weighted_mos, PCT),
+        ("Base Case Margin of Safety", mos, PCT),
+        ("Analyst Consensus", sg(info, "recommendationKey", "N/A"), None),
+        ("Analyst Target (Mean)", sg(info, "targetMeanPrice"), CUR),
+        ("Confidence Level", confidence, None),
+        ("Investment Horizon", horizon, None),
+        ("Risk Level", risk, None),
+    ]
+    for lb, v, fm in summary_data:
+        ws.cell(row=row, column=1, value=lb).font = L_FONT
+        ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=v)
+        if fm:
+            sd(c, fm)
+        else:
+            c.font = D_FONT; c.border = BDR; c.alignment = Alignment(horizontal="center")
+        alt_row(ws, row, 2)
+        row += 1
+
+    # Color upside/downside
+    acf(ws, f"B10:B11")
+
+    # ════════════════════════════════════════════════
+    # SECTION B: MULTI-SCENARIO DCF
+    # ════════════════════════════════════════════════
+    row += 1
+    ws.merge_cells(f"A{row}:G{row}")
+    ws[f"A{row}"].value = "MULTI-SCENARIO DCF"; ws[f"A{row}"].font = S_FONT; row += 2
+
+    scen_hdrs = ["Scenario", "Probability", "FCF Growth (Y1-5)", "WACC", "Term. Growth", "Intrinsic Value", "Margin of Safety"]
+    for j, h in enumerate(scen_hdrs, 1):
+        ws.cell(row=row, column=j, value=h)
+    sh(ws, row, len(scen_hdrs)); row += 1
+
+    for name in ["Bull", "Base", "Bear"]:
+        sc = scenarios[name]
+        ws.cell(row=row, column=1, value=name).font = L_FONT; ws.cell(row=row, column=1).border = BDR
+        for j, (v, fm) in enumerate([
+            (sc["prob"], PCT), (sc["g1"], PCT), (sc["wacc"], PCT),
+            (sc["tg"], PCT), (sc["intrinsic"], CUR), (sc["mos"], PCT),
+        ], 2):
+            c = ws.cell(row=row, column=j, value=v); sd(c, fm)
+
+        # Color the row by scenario
+        if name == "Bull":
+            for cc in range(1, 8):
+                ws.cell(row=row, column=cc).fill = GREEN_BG
+        elif name == "Bear":
+            for cc in range(1, 8):
+                ws.cell(row=row, column=cc).fill = RED_BG
+        row += 1
+
+    # Weighted row
+    ws.cell(row=row, column=1, value="WEIGHTED FAIR VALUE").font = Font(name="Arial", bold=True, color="1B2A4A", size=11)
+    ws.cell(row=row, column=1).border = BDR
+    c = ws.cell(row=row, column=6, value=weighted_iv); sd(c, CUR)
+    c.font = Font(name="Arial", bold=True, color="1B2A4A", size=12)
+    if cp and cp > 0:
+        c2 = ws.cell(row=row, column=7, value=weighted_mos); sd(c2, PCT)
+        c2.font = Font(name="Arial", bold=True, size=12)
+    row += 2
+
+    # ════════════════════════════════════════════════
+    # SECTION B2: DCF MODEL CALIBRATION
+    # ════════════════════════════════════════════════
+    ws.merge_cells(f"A{row}:G{row}")
+    ws[f"A{row}"].value = "DCF MODEL CALIBRATION"; ws[f"A{row}"].font = S_FONT; row += 2
+
+    param_hdrs = ["Parameter", "Used Value", "Source / Rationale", "Reasonable Range", "Sensitivity"]
+    for j, h in enumerate(param_hdrs, 1):
+        ws.cell(row=row, column=j, value=h)
+    sh(ws, row, 5); row += 1
+
+    wacc_src = (f"Full WACC: E/(D+E)×Re + D/(D+E)×Rd×(1-t)"
+                if dcf["wacc_method"] == "full_wacc"
+                else f"CAPM only (no debt data): Rf + β×ERP")
+
+    beta_src = f"yfinance (clamped 0.3-3.0): {dcf['beta']:.2f}"
+
+    params = [
+        ("WACC", dcf["wacc"], PCT, wacc_src, "6% - 14%", "High", 0.06, 0.14),
+        ("Cost of Equity (Re)", dcf["re"], PCT,
+         f"CAPM: {dcf['rf']:.1%} + {dcf['beta']:.2f} × {dcf['erp']:.1%}", "7% - 18%", "Medium", 0.07, 0.18),
+        ("Cost of Debt (Rd)", dcf["rd"] if dcf["rd"] else "N/A",
+         PCT if dcf["rd"] else None,
+         "Interest Exp / Total Debt" if dcf["rd"] else "Not available",
+         "2% - 10%", "Medium", 0.02, 0.10),
+        ("Terminal Growth", dcf["terminal_g"], PCT,
+         f"Sector-calibrated ({info.get('sector', '?')})", "1.5% - 3.5%", "Very High", 0.015, 0.035),
+        ("FCF Growth (Y1-5)", dcf["fcf_growth_1"], PCT,
+         f"Hist. CAGR ({len(fcf_hist)}yr), cap {sbm['growth_cap']:.0%}",
+         f"{sbm['growth_floor']:.0%} - {sbm['growth_cap']:.0%}", "Medium",
+         sbm["growth_floor"], sbm["growth_cap"]),
+        ("FCF Growth (Y6-10)", dcf["fcf_growth_2"], PCT,
+         "60% fade of Y1-5", "2% - 12%", "Medium", 0.02, 0.12),
+        ("Risk-free Rate", dcf["rf"], PCT,
+         "10Y US Treasury proxy (2025)", "3.5% - 5.0%", "Medium", 0.035, 0.05),
+        ("Equity Risk Premium", dcf["erp"], PCT,
+         f"Damodaran base {dcf['erp_base']:.1%} + CRP {dcf['crp']:.1%} ({info.get('country', '?')})",
+         "4.5% - 8.0%", "Medium", 0.045, 0.08),
+        ("Beta", dcf["beta"], DEC, beta_src, "0.3 - 3.0", "Medium", 0.3, 3.0),
+        ("Eff. Tax Rate", dcf["tax_rate"], PCT,
+         f"From financials or country statutory ({info.get('country', '?')})",
+         "9% - 35%", "Low", 0.09, 0.35),
+    ]
+
+    for pname, pval, pfmt, psrc, prng, psens, lo, hi in params:
+        ws.cell(row=row, column=1, value=pname).font = L_FONT
+        ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=pval)
+        if pfmt and pval != "N/A":
+            sd(c, pfmt)
+        else:
+            c.font = D_FONT; c.border = BDR; c.alignment = Alignment(horizontal="center")
+
+        # Out-of-range warning
+        if isinstance(pval, (int, float)) and (pval < lo or pval > hi):
+            c.font = WARN_FONT
+
+        ws.cell(row=row, column=3, value=psrc).font = NOTE_FONT
+        ws.cell(row=row, column=3).border = BDR
+        ws.cell(row=row, column=3).alignment = Alignment(horizontal="left", wrap_text=True)
+        ws.cell(row=row, column=4, value=prng).font = NOTE_FONT
+        ws.cell(row=row, column=4).border = BDR
+        ws.cell(row=row, column=4).alignment = Alignment(horizontal="center")
+
+        sens_fill = RED_BG if psens == "Very High" else YELLOW_BG if psens == "High" else PatternFill()
+        sc_cell = ws.cell(row=row, column=5, value=psens)
+        sc_cell.font = NOTE_FONT; sc_cell.border = BDR
+        sc_cell.alignment = Alignment(horizontal="center"); sc_cell.fill = sens_fill
+
+        alt_row(ws, row, 5)
+        row += 1
+
+    # ════════════════════════════════════════════════
+    # SECTION B3: SENSITIVITY ANALYSIS
+    # ════════════════════════════════════════════════
+    row += 1
+    row = _write_sensitivity_table(ws, row, dcf, stock, info)
+
+    # ════════════════════════════════════════════════
+    # SECTION B4: SANITY CHECKS
+    # ════════════════════════════════════════════════
+    ws.merge_cells(f"A{row}:G{row}")
+    ws[f"A{row}"].value = "SANITY CHECKS"; ws[f"A{row}"].font = S_FONT; row += 2
+
+    chk_hdrs = ["Check", "Value", "Status", "Comment"]
+    for j, h in enumerate(chk_hdrs, 1):
+        ws.cell(row=row, column=j, value=h)
+    sh(ws, row, 4); row += 1
+
+    checks = []
+
+    # 1. Terminal Value Dominance
+    total_val = dcf["pv_tv"] + dcf["pv_fcfs"]
+    tv_pct = dcf["pv_tv"] / total_val if total_val > 0 else 0
+    tv_ok = tv_pct < 0.75
+    checks.append(("Terminal Value Dominance", tv_pct, PCT, tv_ok,
+                    "OK — balanced" if tv_ok else "⚠ Model heavily relies on terminal assumptions"))
+
+    # 2. Reverse DCF — implied growth (perpetuity approximation)
+    mkt_val = cp * dcf["shr"] if cp and dcf["shr"] else 0
+    implied_g = wacc - (lfcf / mkt_val) if mkt_val > 0 and lfcf else None
+    ig_ok = implied_g is not None and -0.05 < implied_g < 0.08
+    checks.append(("Implied Growth (Reverse DCF, perpetuity approx.)", implied_g, PCT, ig_ok,
+                    "OK — market expectation reasonable" if ig_ok else
+                    ("Market implies very optimistic growth" if implied_g and implied_g >= 0.08
+                     else "Cannot compute" if implied_g is None
+                     else "Market implies negative growth")))
+
+    # 3. WACC vs ROIC
+    tax_r = dcf["tax_rate"]
+    nopat = oi * (1 - tax_r) if oi else None
+    invested_cap = (ta - clb) if ta and clb else None
+    roic = nopat / invested_cap if nopat and invested_cap and invested_cap > 0 else None
+    roic_ok = roic is not None and roic > wacc
+    checks.append(("WACC vs ROIC", roic, PCT, roic_ok,
+                    "Firm creates value above cost of capital" if roic_ok else
+                    ("ROIC below WACC — destroying value" if roic is not None else "Cannot compute")))
+
+    # 4. FCF Projection Sanity
+    y5_fcf = dcf["projected_fcfs"][4] if len(dcf["projected_fcfs"]) >= 5 else 0
+    proj_ok = True
+    if lfcf and lfcf > 0:
+        proj_ok = y5_fcf < 2.5 * lfcf
+    checks.append(("FCF Y5 Projection Sanity", y5_fcf, CURM, proj_ok,
+                    "OK — within historical trend" if proj_ok else "⚠ Aggressive projection"))
+
+    # 5. Debt Sustainability
+    debt_payback = net_debt / lfcf if lfcf and lfcf > 0 and net_debt > 0 else None
+    dp_ok = debt_payback is not None and debt_payback < 5
+    checks.append(("Debt Sustainability (Net Debt / FCF)", debt_payback, DEC, dp_ok,
+                    f"Payback in {debt_payback:.1f} years" if debt_payback and dp_ok else
+                    ("High debt — payback > 5 years" if debt_payback else
+                     "N/A (net cash or no FCF)")))
+
+    # 6. FCF Data Quality
+    fcf_ok = dcf["fcf_source"] == "direct"
+    src_labels = {"direct": "Direct from financials", "ocf_capex": "OCF − CapEx",
+                  "estimated_ni": "⚠ Estimated from Net Income (70%)", "no_data": "⚠ No data available"}
+    checks.append(("FCF Data Source", src_labels.get(dcf["fcf_source"], "?"), None, fcf_ok,
+                    "OK — reliable source" if fcf_ok else "Lower reliability — verify manually"))
+
+    for cname, cval, cfmt_chk, c_ok, ccomment in checks:
+        ws.cell(row=row, column=1, value=cname).font = L_FONT
+        ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=cval)
+        if cfmt_chk and cval is not None:
+            sd(c, cfmt_chk)
+        else:
+            c.font = D_FONT; c.border = BDR; c.alignment = Alignment(horizontal="center")
+
+        status_cell = ws.cell(row=row, column=3)
+        if c_ok:
+            status_cell.value = "✅ OK"; status_cell.font = OK_FONT
+        else:
+            status_cell.value = "⚠️ Warning"; status_cell.font = WARN_FONT
+        status_cell.border = BDR; status_cell.alignment = Alignment(horizontal="center")
+
+        ws.merge_cells(f"D{row}:G{row}")
+        cmt = ws.cell(row=row, column=4, value=ccomment)
+        cmt.font = NOTE_FONT; cmt.border = BDR
+        cmt.alignment = Alignment(horizontal="left", wrap_text=True)
+
+        alt_row(ws, row, 7)
+        row += 1
+
+    # ════════════════════════════════════════════════
+    # SECTION C: QUALITATIVE ANALYSIS
+    # ════════════════════════════════════════════════
+    row += 1
+    ws.merge_cells(f"A{row}:G{row}")
+    ws[f"A{row}"].value = "QUALITATIVE ANALYSIS"; ws[f"A{row}"].font = S_FONT; row += 2
+
+    # ── C1: Competitive Moat (FIX 2.3 — multi-factor scoring) ──
+    ws.cell(row=row, column=1, value="COMPETITIVE MOAT").font = L_FONT; row += 1
+
+    sector = info.get("sector", "")
+    moat_map = {
+        "Technology": "Switching Costs / Network Effects",
+        "Communication Services": "Network Effects / Brand",
+        "Consumer Defensive": "Brand / Intangible Assets",
+        "Consumer Cyclical": "Brand / Intangible Assets",
+        "Healthcare": "Patents / Intangible Assets",
+        "Financial Services": "Switching Costs / Scale",
+        "Utilities": "Efficient Scale / Regulation",
+        "Industrials": "Cost Advantage / Scale",
+        "Energy": "Cost Advantage / Scale",
+        "Real Estate": "Efficient Scale",
+        "Basic Materials": "Cost Advantage",
+    }
+    moat_type = moat_map.get(sector, "Undetermined")
+
+    # Multi-factor moat scoring
+    moat_score = 0
+    gm_wide = sbm.get("gross_margin_wide")
+    if gross_margin is not None and gm_wide is not None and gross_margin > gm_wide:
+        moat_score += 1
+    if roe is not None and roe > sbm.get("roe_good", 0.15):
+        moat_score += 1
+    if rev_growth is not None and rev_growth > 0.03:
+        moat_score += 1
+    if de_ratio is not None and de_ratio < (sbm.get("de_threshold") or 2.0):
+        moat_score += 1
+    if fcf_margin is not None and fcf_margin > 0.10:
+        moat_score += 1
+
+    if moat_score >= 4:
+        moat_strength = "Wide"
+    elif moat_score >= 2:
+        moat_strength = "Narrow"
+    else:
+        moat_strength = "None / Weak"
+
+    # Moat trend
+    if gross_margin is not None and gm_prev is not None:
+        gm_delta = gross_margin - gm_prev
+        if gm_delta > 0.02:
+            moat_trend = "Strengthening"
+        elif gm_delta < -0.02:
+            moat_trend = "Weakening"
+        else:
+            moat_trend = "Stable"
+    else:
+        moat_trend = "N/A"
+
+    for lb, v in [("Moat Type (Sector)", moat_type), ("Moat Strength", f"{moat_strength} ({moat_score}/5)"), ("Moat Trend", moat_trend)]:
+        ws.cell(row=row, column=1, value=lb).font = L_FONT; ws.cell(row=row, column=1).border = BDR
+        c = ws.cell(row=row, column=2, value=v); c.font = D_FONT; c.border = BDR
+        c.alignment = Alignment(horizontal="center")
+        alt_row(ws, row, 2)
+        row += 1
+
+    row += 1
+    ws.merge_cells(f"A{row}:G{row}")
+    moat_comment = f"Sector: {sector}. "
+    if gross_margin:
+        moat_comment += f"Gross margin {gross_margin:.0%}"
+        if gm_wide:
+            moat_comment += f" (sector wide-moat threshold: {gm_wide:.0%}). "
+        else:
+            moat_comment += ". "
+    else:
+        moat_comment += "Insufficient data for margin-based moat assessment. "
+    moat_comment += f"Moat score {moat_score}/5 (GM, ROE, Rev Growth, Leverage, FCF Margin)."
+    c = ws.cell(row=row, column=1, value=moat_comment)
+    c.font = Font(name="Arial", italic=True, color="555555", size=9)
+    c.alignment = Alignment(wrap_text=True, vertical="top")
+    row += 2
+
+    # ── C2: Bull Case (FIX 2.4 — sector-calibrated thresholds) ──
+    ws.cell(row=row, column=1, value="BULL CASE").font = Font(name="Arial", bold=True, color="006100", size=11)
+    ws.cell(row=row, column=1).fill = GREEN_BG; ws.cell(row=row, column=1).border = BDR; row += 1
+
+    bull_points = []
+    rev_bull = sbm.get("rev_growth_bull", 0.10)
+    if rev_growth and rev_growth > rev_bull:
+        bull_points.append(f"Strong revenue growth ({rev_growth:.1%} YoY, above {rev_bull:.0%} sector threshold)")
+    if fcf_margin and fcf_margin > 0.15:
+        bull_points.append(f"Healthy FCF generation ({fcf_margin:.1%} FCF margin)")
+    roe_good = sbm.get("roe_good", 0.15)
+    if roe and roe > roe_good:
+        bull_points.append(f"Above-average ROE ({roe:.1%}, sector benchmark {roe_good:.0%})")
+    if current_ratio and current_ratio > 2.0:
+        bull_points.append(f"Strong liquidity (Current Ratio: {current_ratio:.2f})")
+    dy = info.get("dividendYield")
+    if dy and isinstance(dy, (int, float)) and dy > 0.02:
+        bull_points.append(f"Attractive dividend yield ({dy:.1%})")
+    rec = info.get("recommendationKey", "")
+    if rec in ("buy", "strong_buy"):
+        bull_points.append(f"Analyst consensus: {rec.upper()}")
+    if weighted_mos > 0.15:
+        bull_points.append(f"Undervalued based on weighted DCF ({weighted_mos:.0%} upside)")
+    if gross_margin and gm_wide and gross_margin > gm_wide:
+        bull_points.append(f"High gross margin ({gross_margin:.0%}) — above sector wide-moat threshold")
+
+    if not bull_points:
+        bull_points.append("No strong bullish signals detected from available data")
+
+    for pt in bull_points[:6]:
+        ws.merge_cells(f"A{row}:G{row}")
+        c = ws.cell(row=row, column=1, value=f"•  {pt}")
+        c.font = Font(name="Arial", color="006100", size=10); c.border = BDR
+        c.alignment = Alignment(horizontal="left", wrap_text=True)
+        row += 1
+
+    row += 1
+
+    # ── C3: Bear Case ──
+    ws.cell(row=row, column=1, value="BEAR CASE").font = Font(name="Arial", bold=True, color="C00000", size=11)
+    ws.cell(row=row, column=1).fill = RED_BG; ws.cell(row=row, column=1).border = BDR; row += 1
+
+    bear_points = []
+    b = info.get("beta")
+    if b and isinstance(b, (int, float)) and b > 1.3:
+        bear_points.append(f"Higher volatility than market (Beta: {b:.2f})")
+    de_thresh = sbm.get("de_threshold")
+    if de_ratio is not None and de_thresh is not None and de_ratio > de_thresh:
+        bear_points.append(f"Elevated leverage (D/E: {de_ratio:.2f}, sector threshold: {de_thresh:.1f})")
+    elif te is not None and te < 0:
+        bear_points.append("Negative equity — aggressive buybacks or accumulated losses")
+    if lfcf and lfcf < 0:
+        bear_points.append("Negative free cash flow — cash burn risk")
+    pe_hi = sbm.get("pe_normal", (12, 25))[1]
+    tpe = info.get("trailingPE")
+    if tpe and isinstance(tpe, (int, float)) and tpe > pe_hi:
+        bear_points.append(f"Expensive valuation (P/E: {tpe:.1f}, sector normal range up to {pe_hi})")
+    if rev_growth and rev_growth < 0:
+        bear_points.append(f"Declining revenue ({rev_growth:.1%} YoY)")
+    pr = info.get("payoutRatio")
+    if pr and isinstance(pr, (int, float)) and pr > 0.80:
+        bear_points.append(f"Dividend payout ratio unsustainably high ({pr:.0%})")
+    spf = info.get("shortPercentOfFloat")
+    if spf and isinstance(spf, (int, float)) and spf > 0.05:
+        bear_points.append(f"Elevated short interest ({spf:.1%} of float)")
+    if weighted_mos < -0.15:
+        bear_points.append(f"Overvalued based on weighted DCF ({weighted_mos:.0%})")
+    if net_margin and net_margin < 0.05:
+        bear_points.append(f"Thin net margin ({net_margin:.1%})")
+    if dcf["fcf_source"] == "estimated_ni":
+        bear_points.append("FCF data unavailable — valuation uses estimated proxy (70% of NI)")
+
+    if not bear_points:
+        bear_points.append("No strong bearish signals detected from available data")
+
+    for pt in bear_points[:6]:
+        ws.merge_cells(f"A{row}:G{row}")
+        c = ws.cell(row=row, column=1, value=f"•  {pt}")
+        c.font = Font(name="Arial", color="C00000", size=10); c.border = BDR
+        c.alignment = Alignment(horizontal="left", wrap_text=True)
+        row += 1
+
+    row += 1
+
+    # ── C4: Management & Ownership ──
+    ws.cell(row=row, column=1, value="MANAGEMENT & OWNERSHIP").font = S_FONT; row += 1
+
+    officers = info.get("companyOfficers", [])
+    ceo_name = "N/A"
+    if officers and isinstance(officers, list):
+        for o in officers:
+            title = o.get("title", "").lower()
+            if "ceo" in title or "chief executive" in title:
+                ceo_name = f"{o.get('name', 'N/A')} - {o.get('title', 'N/A')}"; break
+        if ceo_name == "N/A" and officers:
+            ceo_name = f"{officers[0].get('name', 'N/A')} - {officers[0].get('title', 'N/A')}"
+
+    ins = info.get("heldPercentInsiders")
+    inst = info.get("heldPercentInstitutions")
+    gov = info.get("overallRisk")
+
+    mgmt_data = [
+        ("CEO", ceo_name, None),
+        ("Insider Ownership", ins, PCT),
+        ("Institutional Ownership", inst, PCT),
+        ("Governance Risk Score", gov, DEC),
+    ]
+    for lb, v, fm in mgmt_data:
+        ws.cell(row=row, column=1, value=lb).font = L_FONT
+        ws.cell(row=row, column=1).border = BDR
+        if v is not None and v != "N/A":
+            c = ws.cell(row=row, column=2, value=v)
+            if fm:
+                sd(c, fm)
+            else:
+                c.font = D_FONT; c.border = BDR; c.alignment = Alignment(horizontal="center")
+        else:
+            c = ws.cell(row=row, column=2, value="N/A")
+            c.font = Font(name="Arial", color="999999", size=9, italic=True)
+            c.border = BDR; c.alignment = Alignment(horizontal="center")
+        alt_row(ws, row, 2)
+        row += 1
+
+    # Disclaimer
+    row += 1
+    ws.merge_cells(f"A{row}:G{row}")
+    c = ws.cell(row=row, column=1,
+                value="Note: This analysis is for informational purposes only and does not constitute investment advice. "
+                      "DCF models are highly sensitive to input assumptions. Verify data against SEC filings, "
+                      "earnings calls, and multiple independent sources before making investment decisions.")
+    c.font = Font(name="Arial", italic=True, color="999999", size=8)
+    c.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # ── Formatting ──
+    ws.freeze_panes = "A3"
+    ws.column_dimensions["A"].width = 32
+    for col in ["B", "C", "D", "E", "F", "G"]:
+        ws.column_dimensions[col].width = 18
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python analyze.py <TICKER>\nExample: python analyze.py AAPL")
+        sys.exit(1)
+
+    ticker = sys.argv[1].upper()
+    print(f"\n{'='*60}")
+    print(f"  Stock Analysis Tool v2.0 (Audit-Fixed) - {ticker}")
+    print(f"{'='*60}\n")
+
+    print(f"[1/8] Downloading data for {ticker}...")
+    stock = yf.Ticker(ticker)
+    try:
+        info = stock.info
+        if not info or "shortName" not in info:
+            print(f"ERROR: No data for '{ticker}'."); sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: {e}"); sys.exit(1)
+
+    currency = info.get("currency", "USD")
+    print(f"       Company: {info.get('shortName', '?')}  |  Sector: {info.get('sector', '?')}  |  Currency: {currency}")
+
+    print("[2/8] Fetching historical prices...")
+    hist = stock.history(period="1y")
+
+    print("[3/8] Creating workbook...")
+    wb = Workbook()
+
+    print("[4/8] Dashboard...")
+    create_dashboard(wb, ticker, info, hist)
+
+    print("[5/8] Financial Statements & Ratios...")
+    create_financials(wb, stock)
+    create_ratios(wb, stock, info)
+
+    print("[6/8] Valuation (DCF)...")
+    create_valuation(wb, stock, info)
+
+    print("[7/8] Technical, Dividends & Risk...")
+    create_technical(wb, ticker, hist, info)
+    create_dividends(wb, stock, info)
+    create_risk(wb, stock, info, hist)
+
+    print("[8/8] Investment Verdict (Multi-Scenario)...")
+    create_investment_verdict(wb, stock, info, hist)
+
+    fn = f"{ticker}_Analysis_{datetime.date.today().strftime('%Y%m%d')}.xlsx"
+    wb.save(fn)
+
+    print(f"\n{'='*60}")
+    print(f"  Done! Saved: {fn}")
+    print(f"{'='*60}")
+    print(f"\n  Sheets: Dashboard | Financial Statements | Financial Ratios")
+    print(f"  Valuation (DCF) | Technical Analysis | Dividends | Risk & Sentiment")
+    print(f"  >>> Investment Verdict (UPGRADED: Multi-Scenario DCF + Sensitivity)")
+    print(f"\n  Key improvements in v2.0:")
+    print(f"  • Proper WACC (debt-weighted, not just cost of equity)")
+    print(f"  • 3-scenario DCF (Bull/Base/Bear) with weighted fair value")
+    print(f"  • WACC × Terminal Growth sensitivity matrix")
+    print(f"  • Sector-calibrated thresholds ({info.get('sector', '?')})")
+    print(f"  • Currency-aware formatting ({currency})")
+    print(f"  • Negative equity, zero FCF, extreme beta guards")
+    print(f"  • Effective tax rate (from financials or country-based)")
+    print(f"\n  Tip: Edit blue cells in Valuation to adjust DCF assumptions.\n")
+
+
+if __name__ == "__main__":
+    main()
